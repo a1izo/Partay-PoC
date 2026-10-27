@@ -1,0 +1,375 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Partay PoC</title>
+</head>
+<body>
+<h1>Partay PoC</h1>
+<p>
+  <button id="next" type="button">Next step</button>
+  <button id="runAll" type="button">Run all</button>
+  <button id="reset" type="button">Reset</button>
+</p>
+<p>
+  <label>Live search as: <select id="guest"></select></label>
+  <input id="search" type="text" size="40" autocomplete="off">
+</p>
+<pre id="log"></pre>
+
+<script>
+// T1 demo client. Calls the same REST endpoints as every other client and holds no rules.
+// Prints everything as plain text into one <pre>, oldest first. Never uses innerHTML with API data.
+'use strict';
+
+const logEl = document.getElementById('log');
+const guestSelect = document.getElementById('guest');
+const searchInput = document.getElementById('search');
+const INDENT = '          ';
+
+// Page memory. A browser refresh starts over.
+let state;
+function freshState() {
+  return { step: 0, party: null, guests: {}, names: {}, items: {}, lastTraceId: 0, spotifyMode: null,
+           searchResults: [], busy: false };
+}
+state = freshState();
+
+// Skip traces of requests made before this page was opened.
+fetch('/api/debug/traces').then(r => r.json()).then(t => {
+  if (Array.isArray(t) && t.length && state.lastTraceId === 0) state.lastTraceId = t[t.length - 1].id;
+}).catch(() => {});
+
+// ---------- printing ----------
+
+function print(line) {
+  logEl.appendChild(document.createTextNode(line + '\n'));
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+function now() {
+  return new Date().toTimeString().slice(0, 8);
+}
+
+function pad(s, n) {
+  s = String(s);
+  return s.length >= n ? s : s + ' '.repeat(n - s.length);
+}
+
+function padLeft(s, n) {
+  s = String(s);
+  return s.length >= n ? s : ' '.repeat(n - s.length) + s;
+}
+
+function duration(ms) {
+  const s = Math.floor(ms / 1000);
+  return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function isQueue(body) {
+  return body && Array.isArray(body.items) && 'joinCode' in body;
+}
+
+function printQueue(queue) {
+  print(INDENT + 'queue:');
+  if (queue.items.length === 0) {
+    print(INDENT + '  (empty)');
+    return;
+  }
+  const w = (key) => Math.max(...queue.items.map(i => String(i[key]).length));
+  const wt = w('title'), wa = w('artist'), wb = w('addedBy');
+  for (const i of queue.items) {
+    print(INDENT + '  ' + padLeft(i.position, 2) + '  ' + pad(i.title, wt) + '  ' + pad(i.artist, wa) + '  ' +
+          pad(i.addedBy, wb) + '  score ' + padLeft(i.score, 2) + '  (+' + i.upvotes + ' -' + i.downvotes + ')');
+  }
+}
+
+function hopText(h) {
+  const type = { GRPC: 'gRPC', SPOTIFY: 'Spotify', CACHE: 'cache' }[h.type] || h.type;
+  return type + ' ' + h.name + ' ' + h.status + ' ' + h.ms + ' ms';
+}
+
+// Reads the traces of the calls that just finished and prints their hops on one line.
+async function printHops() {
+  let traces;
+  try {
+    const res = await fetch('/api/debug/traces?after=' + state.lastTraceId);
+    traces = await res.json();
+  } catch (e) {
+    print(INDENT + 'hops: (could not read traces: ' + e.message + ')');
+    return;
+  }
+  if (!Array.isArray(traces) || traces.length === 0) {
+    print(INDENT + 'hops: (none)');
+    return;
+  }
+  state.lastTraceId = traces[traces.length - 1].id;
+  const parts = traces.map(t => {
+    const hops = t.hops.length ? t.hops.map(hopText).join(', ') : '(none)';
+    return traces.length > 1 ? t.method + ' ' + t.path + ': ' + hops : hops;
+  });
+  print(INDENT + 'hops: ' + parts.join(' | '));
+}
+
+// ---------- the one API helper ----------
+
+// Never throws on 4xx or 5xx. Prints the request, the response and the hops. Returns { status, body }.
+// opts.queue = false prints a queue response as one line instead of the table.
+async function api(method, path, body, guestId, opts = {}) {
+  const headers = {};
+  if (body !== undefined) headers['Content-Type'] = 'application/json';
+  if (guestId) headers['X-Guest-Id'] = guestId;
+  const who = guestId ? nicknameOf(guestId) : null;
+  if (!opts.silentRequest) {
+    print(now() + '  ' + pad(method, 4) + ' ' + path + (who ? '  as ' + who : '') +
+          (body !== undefined ? '  ' + JSON.stringify(body) : ''));
+  }
+  let status = 0, data = null;
+  try {
+    const res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body),
+                                    signal: opts.signal });
+    status = res.status;
+    const text = await res.text();
+    try { data = text ? JSON.parse(text) : null; } catch (e) { data = text; }
+  } catch (e) {
+    if (e.name === 'AbortError') throw e;
+    print(INDENT + '0    request failed: ' + e.message + ' (is T2 running?)');
+    return { status: 0, body: null };
+  }
+  if (opts.render) {
+    opts.render(status, data);
+  } else if (isQueue(data) && status < 300) {
+    print(INDENT + status + (opts.queue === false ? '  (ranked queue, ' + data.items.length + ' items)' : '  (queue below)'));
+  } else {
+    print(INDENT + status + '  ' + (data === null ? '' : JSON.stringify(data)));
+  }
+  await printHops();
+  if (isQueue(data) && status < 300 && opts.queue !== false) printQueue(data);
+  return { status, body: data };
+}
+
+function nicknameOf(guestId) {
+  return state.names[guestId] || null;
+}
+
+function addGuest(nickname, guestId) {
+  state.guests[nickname] = guestId;
+  state.names[guestId] = nickname;
+  const opt = document.createElement('option');
+  opt.value = nickname;
+  opt.textContent = nickname;
+  guestSelect.appendChild(opt);
+}
+
+function printSearch(query, status, data) {
+  if (status !== 200) {
+    print(INDENT + status + '  ' + JSON.stringify(data));
+    return;
+  }
+  const source = data.cached ? 'from T2 cache' : (state.spotifyMode === 'mock' ? 'mock tracks' : 'live from Spotify');
+  print(INDENT + '200  ' + data.tookMs + ' ms  ' + source);
+  if (data.tracks.length === 0) print(INDENT + '  (no results)');
+  const wt = Math.max(0, ...data.tracks.map(t => t.title.length));
+  const wa = Math.max(0, ...data.tracks.map(t => t.artist.length));
+  data.tracks.forEach((t, i) => {
+    print(INDENT + '  ' + (i + 1) + '  ' + pad(t.title, wt) + '  ' + pad(t.artist, wa) + '  ' + duration(t.durationMs));
+  });
+}
+
+async function search(query, guestName, signal) {
+  print('');
+  print(now() + '  SEARCH' + (guestName ? ' as ' + guestName : '') + '  "' + query + '"');
+  return api('GET', '/api/search?q=' + encodeURIComponent(query) + '&limit=5', undefined, undefined,
+             { silentRequest: true, signal, render: (s, d) => printSearch(query, s, d) });
+}
+
+// Search as a guest and add the first result. Returns the add response.
+async function searchAndAdd(query, nickname) {
+  const r = await search(query, nickname);
+  if (r.status !== 200 || r.body.tracks.length === 0) return r;
+  const track = r.body.tracks[0];
+  const add = await api('POST', '/api/parties/' + state.party.joinCode + '/queue',
+                        { spotifyTrackId: track.spotifyTrackId }, state.guests[nickname]);
+  if (add.status === 201) state.items[track.title] = add.body.itemId;
+  return add;
+}
+
+function vote(nickname, title, value, opts) {
+  return api('PUT', '/api/parties/' + state.party.joinCode + '/queue/' + state.items[title] + '/vote',
+             { value }, state.guests[nickname], opts);
+}
+
+// ---------- guided demo (same story as demo.ps1) ----------
+
+// Each step returns its responses. A step with a 5xx or failed call can be run again with "Next step".
+const steps = [
+  ['Health check', async () => {
+    const r = await api('GET', '/api/health');
+    if (r.body && r.body.spotifyMode) state.spotifyMode = r.body.spotifyMode;
+    return [r];
+  }],
+  ['Mikkel creates a party', async () => {
+    const r = await api('POST', '/api/parties', { name: 'Friday pre-drinks', hostNickname: 'Mikkel' });
+    if (r.status === 201) {
+      state.party = r.body;
+      addGuest('Mikkel', r.body.host.guestId);
+      print(INDENT + 'join code: ' + r.body.joinCode);
+    }
+    return [r];
+  }],
+  ['Sofia and Jonas join', async () => {
+    const out = [];
+    for (const name of ['Sofia', 'Jonas']) {
+      if (state.guests[name]) continue;
+      const r = await api('POST', '/api/parties/' + state.party.joinCode + '/guests', { nickname: name });
+      if (r.status === 201) addGuest(name, r.body.guestId);
+      out.push(r);
+    }
+    guestSelect.value = 'Sofia';
+    return out;
+  }],
+  ['"sofia" tries to join again (expect 409, nicknames are case-insensitive)', async () => {
+    return [await api('POST', '/api/parties/' + state.party.joinCode + '/guests', { nickname: 'sofia' })];
+  }],
+  ['Guests search Spotify and add a song each (only the track ID is sent)', async () => {
+    const out = [];
+    const plan = [['blinding lights', 'Sofia', 'Blinding Lights'], ['mr brightside', 'Mikkel', 'Mr. Brightside'],
+                  ['september earth wind', 'Jonas', 'September']];
+    for (const [query, name, title] of plan) {
+      if (state.items[title]) continue;
+      out.push(await searchAndAdd(query, name));
+    }
+    out.push(await search('blinding lights', 'Sofia'));  // repeat: served from the T2 cache
+    print('');
+    out.push(await api('GET', '/api/parties/' + state.party.joinCode + '/queue'));
+    return out;
+  }],
+  ['Mikkel and Sofia upvote September, Jonas downvotes Mr. Brightside', async () => [
+    await vote('Mikkel', 'September', 1, { queue: false }),
+    await vote('Sofia', 'September', 1, { queue: false }),
+    await vote('Jonas', 'Mr. Brightside', -1),
+  ]],
+  ['Sofia switches her vote on September to -1 (it drops by 2)', async () => [
+    await vote('Sofia', 'September', -1),
+  ]],
+  ['Error cases: 404, 400, 400, 403, 409', async () => {
+    const code = state.party.joinCode;
+    const sept = state.items['September'];
+    const out = [];
+    print(INDENT + '-- wrong join code (404)');
+    out.push(await api('GET', '/api/parties/ZZZZZZ'));
+    print(INDENT + '-- vote value 5 (400)');
+    out.push(await api('PUT', '/api/parties/' + code + '/queue/' + sept + '/vote', { value: 5 }, state.guests.Sofia));
+    print(INDENT + '-- missing X-Guest-Id (400)');
+    out.push(await api('PUT', '/api/parties/' + code + '/queue/' + sept + '/vote', { value: 1 }));
+    print(INDENT + '-- guest from a second party votes here (403)');
+    const other = await api('POST', '/api/parties', { name: 'Other party', hostNickname: 'Lars' });
+    out.push(other);
+    if (other.status === 201) {
+      state.names[other.body.host.guestId] = 'Lars (other party)';
+      out.push(await api('PUT', '/api/parties/' + code + '/queue/' + sept + '/vote', { value: 1 }, other.body.host.guestId));
+    }
+    print(INDENT + '-- Sofia adds Blinding Lights again (409)');
+    const queue = await api('GET', '/api/parties/' + code + '/queue', undefined, undefined, { queue: false });
+    out.push(queue);
+    const blinding = queue.body && queue.body.items ? queue.body.items.find(i => i.title === 'Blinding Lights') : null;
+    if (blinding) {
+      out.push(await api('POST', '/api/parties/' + code + '/queue', { spotifyTrackId: blinding.spotifyTrackId },
+                         state.guests.Sofia));
+    }
+    return out;
+  }],
+  ['Final queue', async () => {
+    const r = await api('GET', '/api/parties/' + state.party.joinCode + '/queue');
+    print(INDENT + 'join code for search.ps1: ' + state.party.joinCode);
+    return [r];
+  }],
+];
+
+async function nextStep() {
+  if (state.step >= steps.length) {
+    print('');
+    print(now() + '  Demo complete. Use the live search, or click Reset to start over.');
+    return false;
+  }
+  const [title, run] = steps[state.step];
+  print('');
+  print(now() + '  STEP ' + (state.step + 1) + '  ' + title);
+  const responses = await run();
+  const failed = responses.some(r => r.status === 0 || r.status >= 500);
+  if (failed) {
+    print(INDENT + '(step did not complete because a tier is down. Click "Next step" to run it again.)');
+    return false;
+  }
+  state.step++;
+  return true;
+}
+
+async function guarded(fn) {
+  if (state.busy) return;
+  state.busy = true;
+  try { await fn(); } finally { state.busy = false; }
+}
+
+document.getElementById('next').addEventListener('click', () => guarded(nextStep));
+
+document.getElementById('runAll').addEventListener('click', () => guarded(async () => {
+  while (state.step < steps.length) {
+    if (!(await nextStep())) return;
+    if (state.step < steps.length) await new Promise(r => setTimeout(r, 1500));
+  }
+}));
+
+document.getElementById('reset').addEventListener('click', async () => {
+  if (searchAbort) searchAbort.abort();
+  state = freshState();
+  logEl.textContent = '';
+  guestSelect.textContent = '';
+  searchInput.value = '';
+  try { await fetch('/api/debug/traces', { method: 'DELETE' }); } catch (e) { /* T2 down: nothing to clear */ }
+});
+
+// ---------- live search ----------
+
+let searchTimer = null;
+let searchAbort = null;
+
+searchInput.addEventListener('input', () => {
+  clearTimeout(searchTimer);
+  const text = searchInput.value.trim();
+  if (text.length < 2) return;
+  searchTimer = setTimeout(async () => {
+    if (searchAbort) searchAbort.abort();
+    searchAbort = new AbortController();
+    try {
+      const r = await search(text, guestSelect.value || null, searchAbort.signal);
+      if (r.status === 200) state.searchResults = r.body.tracks;
+    } catch (e) {
+      if (e.name !== 'AbortError') print(INDENT + 'search failed: ' + e.message);
+    }
+  }, 300);
+});
+
+// A number from 1 to 5 followed by Enter adds that track as the selected guest.
+searchInput.addEventListener('keydown', (ev) => {
+  if (ev.key !== 'Enter') return;
+  const text = searchInput.value.trim();
+  if (!/^[1-5]$/.test(text)) return;
+  ev.preventDefault();
+  guarded(async () => {
+    const track = state.searchResults[Number(text) - 1];
+    const name = guestSelect.value;
+    print('');
+    if (!track) { print(now() + '  no search result number ' + text); return; }
+    if (!state.party || !name) { print(now() + '  join a party first (run the demo up to the join step)'); return; }
+    print(now() + '  ADD as ' + name + '  #' + text + ' ' + track.title + ' - ' + track.artist);
+    const add = await api('POST', '/api/parties/' + state.party.joinCode + '/queue',
+                          { spotifyTrackId: track.spotifyTrackId }, state.guests[name]);
+    if (add.status === 201) state.items[track.title] = add.body.itemId;
+    await api('GET', '/api/parties/' + state.party.joinCode + '/queue', undefined, state.guests[name]);
+    searchInput.value = '';
+  });
+});
+</script>
+</body>
+</html>

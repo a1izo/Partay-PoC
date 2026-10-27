@@ -1,0 +1,6 @@
+CREATE DATABASE IF NOT EXISTS partay CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+CREATE USER IF NOT EXISTS 'partay'@'localhost' IDENTIFIED BY 'partay';
+CREATE USER IF NOT EXISTS 'partay'@'%' IDENTIFIED BY 'partay';
+GRANT ALL PRIVILEGES ON partay.* TO 'partay'@'localhost';
+GRANT ALL PRIVILEGES ON partay.* TO 'partay'@'%';
+FLUSH PRIVILEGES;
